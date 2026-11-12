@@ -1,5 +1,6 @@
 import asyncio
 import html
+import io
 import json
 import logging
 import os
@@ -8,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -42,6 +43,9 @@ office_lock = asyncio.Lock()        # LibreOffice لا يعمل بعمليات �
 
 LANGS = {"ar": "🇩🇿 العربية", "en": "🇬🇧 English", "fr": "🇫🇷 Français"}
 
+# لغات Tesseract حسب لغة المستخدم (تحتاج الحزم: tesseract-ocr-ara / eng / fra)
+OCR_LANGS = {"ar": "ara+eng", "en": "eng", "fr": "fra+eng"}
+
 # ======================= الصيغ =======================
 CATEGORIES = {
     "image": {"jpg", "jpeg", "png", "webp", "bmp", "gif", "tiff"},
@@ -72,7 +76,8 @@ T = {
             "👋 أهلاً <b>{name}</b>!\n\n"
             "أنا <b>{bot}</b> ✨ بوت تحويل صيغ الملفات بسرعة وسهولة.\n\n"
             "📎 <b>أرسل لي أي ملف</b> (صورة، صوت، فيديو، مستند، جدول) "
-            "وسأعرض عليك الصيغ المتاحة للتحويل.\n\n"
+            "وسأعرض عليك الصيغ المتاحة للتحويل.\n"
+            "📝 وللصور: يمكنني أيضاً <b>استخراج النص</b> منها.\n\n"
             "📏 الحد الأقصى للحجم: <b>20 ميغابايت</b>"
         ),
         "help": (
@@ -82,6 +87,7 @@ T = {
             "3️⃣ انتظر لحظات واستلم الملف المحوّل ✅\n\n"
             "💡 <b>نصائح</b>\n"
             "• يمكنك إرسال الصور كـ «ملف» للحفاظ على الجودة الأصلية\n"
+            "• لاستخراج النص من صورة اضغط «📝 استخراج النص» (الصور الواضحة تعطي نتائج أدق)\n"
             "• الفيديوهات الطويلة قد تحتاج وقتاً أطول\n\n"
             "⌨️ <b>الأوامر</b>\n"
             "/start - القائمة الرئيسية\n"
@@ -97,9 +103,13 @@ T = {
         "btn_lang": "🌐 اللغة",
         "btn_back": "🔙 رجوع",
         "btn_cancel": "✖️ إلغاء",
+        "btn_ocr": "📝 استخراج النص",
         "ask_target": "📁 <b>{name}</b>\n📦 الحجم: {size}\n\n👇 اختر الصيغة المطلوبة:",
         "downloading": "📥 جاري تنزيل الملف...",
         "converting": "⚙️ جاري التحويل إلى <b>{fmt}</b>...",
+        "ocr_running": "🔎 جاري استخراج النص...",
+        "ocr_done": "✅ <b>النص المستخرج</b>",
+        "ocr_empty": "🤷 لم أجد أي نص في هذه الصورة.\nجرّب صورة أوضح.",
         "sending": "📤 جاري إرسال الملف...",
         "done": "✅ تم التحويل إلى <b>{fmt}</b> خلال {secs} ثانية",
         "cancelled": "🚫 تم إلغاء العملية.",
@@ -124,7 +134,8 @@ T = {
             "👋 Hello <b>{name}</b>!\n\n"
             "I'm <b>{bot}</b> ✨ a fast and easy file format converter.\n\n"
             "📎 <b>Send me any file</b> (image, audio, video, document, spreadsheet) "
-            "and I'll show you the available formats.\n\n"
+            "and I'll show you the available formats.\n"
+            "📝 For images, I can also <b>extract the text</b> from them.\n\n"
             "📏 Max file size: <b>20 MB</b>"
         ),
         "help": (
@@ -134,6 +145,7 @@ T = {
             "3️⃣ Wait a moment and get your converted file ✅\n\n"
             "💡 <b>Tips</b>\n"
             "• Send images as a \"file\" to keep the original quality\n"
+            "• To extract text from an image tap \"📝 Extract text\" (clear images give better results)\n"
             "• Long videos may take more time\n\n"
             "⌨️ <b>Commands</b>\n"
             "/start - Main menu\n"
@@ -149,9 +161,13 @@ T = {
         "btn_lang": "🌐 Language",
         "btn_back": "🔙 Back",
         "btn_cancel": "✖️ Cancel",
+        "btn_ocr": "📝 Extract text",
         "ask_target": "📁 <b>{name}</b>\n📦 Size: {size}\n\n👇 Choose the target format:",
         "downloading": "📥 Downloading your file...",
         "converting": "⚙️ Converting to <b>{fmt}</b>...",
+        "ocr_running": "🔎 Extracting text...",
+        "ocr_done": "✅ <b>Extracted text</b>",
+        "ocr_empty": "🤷 No text found in this image.\nTry a clearer one.",
         "sending": "📤 Sending the file...",
         "done": "✅ Converted to <b>{fmt}</b> in {secs}s",
         "cancelled": "🚫 Operation cancelled.",
@@ -176,7 +192,8 @@ T = {
             "👋 Bonjour <b>{name}</b> !\n\n"
             "Je suis <b>{bot}</b> ✨ un convertisseur de formats de fichiers rapide et simple.\n\n"
             "📎 <b>Envoyez-moi un fichier</b> (image, audio, vidéo, document, tableur) "
-            "et je vous proposerai les formats disponibles.\n\n"
+            "et je vous proposerai les formats disponibles.\n"
+            "📝 Pour les images, je peux aussi <b>extraire le texte</b>.\n\n"
             "📏 Taille maximale : <b>20 Mo</b>"
         ),
         "help": (
@@ -186,6 +203,7 @@ T = {
             "3️⃣ Patientez un instant et recevez le fichier converti ✅\n\n"
             "💡 <b>Astuces</b>\n"
             "• Envoyez les images en tant que « fichier » pour garder la qualité d'origine\n"
+            "• Pour extraire le texte d'une image, appuyez sur « 📝 Extraire le texte » (une image nette donne de meilleurs résultats)\n"
             "• Les longues vidéos peuvent prendre plus de temps\n\n"
             "⌨️ <b>Commandes</b>\n"
             "/start - Menu principal\n"
@@ -201,9 +219,13 @@ T = {
         "btn_lang": "🌐 Langue",
         "btn_back": "🔙 Retour",
         "btn_cancel": "✖️ Annuler",
+        "btn_ocr": "📝 Extraire le texte",
         "ask_target": "📁 <b>{name}</b>\n📦 Taille : {size}\n\n👇 Choisissez le format voulu :",
         "downloading": "📥 Téléchargement du fichier...",
         "converting": "⚙️ Conversion en <b>{fmt}</b>...",
+        "ocr_running": "🔎 Extraction du texte...",
+        "ocr_done": "✅ <b>Texte extrait</b>",
+        "ocr_empty": "🤷 Aucun texte trouvé dans cette image.\nEssayez une image plus nette.",
         "sending": "📤 Envoi du fichier...",
         "done": "✅ Converti en <b>{fmt}</b> en {secs} s",
         "cancelled": "🚫 Opération annulée.",
@@ -381,6 +403,67 @@ async def convert(category: str, src: Path, dst: Path):
         await convert_pdf_to_docx(src, dst)
 
 
+# ======================= استخراج النص (OCR) =======================
+def prep_for_ocr(src: Path, dst: Path):
+    """تحسين الصورة قبل OCR: تدوير EXIF، تدرّج رمادي، تكبير، تباين."""
+    with Image.open(src) as img:
+        img = ImageOps.exif_transpose(img).convert("L")
+        if max(img.size) < 1500:
+            scale = 1500 / max(img.size)
+            img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        img = ImageOps.autocontrast(img)
+        img.save(dst, "PNG")
+
+
+async def ocr_image(src: Path, lang: str) -> str:
+    prepared = src.with_name("ocr_in.png")
+    out_base = src.with_name("ocr_out")
+    await asyncio.to_thread(prep_for_ocr, src, prepared)
+    await run_cmd("tesseract", str(prepared), str(out_base), "-l", OCR_LANGS.get(lang, "ara+eng"))
+    return out_base.with_suffix(".txt").read_text(encoding="utf-8", errors="ignore").strip()
+
+
+async def do_ocr(q, context: ContextTypes.DEFAULT_TYPE, info: dict, lang: str):
+    t = T[lang]
+    chat_id = q.message.chat_id
+    async with CONVERT_SEM:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            src = tmp / f"input.{info['ext']}"
+
+            await safe_edit(q, t["downloading"])
+            tg_file = await context.bot.get_file(info["file_id"])
+            await tg_file.download_to_drive(src)
+
+            await safe_edit(q, t["ocr_running"])
+            await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+            text = await ocr_image(src, lang)
+
+    if not text:
+        await safe_edit(q, t["ocr_empty"])
+        return
+
+    if len(text) <= 3800:
+        await context.bot.send_message(
+            chat_id,
+            f"{t['ocr_done']}\n\n<pre>{html.escape(text)}</pre>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:  # النص طويل: أرسله كملف txt
+        bio = io.BytesIO(text.encode("utf-8"))
+        await context.bot.send_document(
+            chat_id,
+            document=bio,
+            filename=f"{Path(info['name']).stem or 'text'}.txt",
+            caption=t["ocr_done"],
+            parse_mode=ParseMode.HTML,
+        )
+
+    await q.delete_message()
+    get_user(q.from_user.id)["conversions"] += 1
+    save_users()
+
+
 # ======================= الأوامر =======================
 async def send_welcome(target, update: Update, lang: str):
     name = html.escape(update.effective_user.first_name or "")
@@ -510,6 +593,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons = [InlineKeyboardButton(x.upper(), callback_data=f"conv:{key}:{x}") for x in options]
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    if category == "image":  # زر استخراج النص يظهر مع الصور فقط
+        rows.insert(0, [InlineKeyboardButton(t["btn_ocr"], callback_data=f"conv:{key}:ocr")])
     rows.append([InlineKeyboardButton(t["btn_cancel"], callback_data=f"cancel:{key}")])
 
     await msg.reply_text(
@@ -533,6 +618,10 @@ async def on_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     started = time.monotonic()
     try:
+        if target == "ocr":
+            await do_ocr(q, context, info, lang)
+            return
+
         async with CONVERT_SEM:
             with tempfile.TemporaryDirectory() as tmp:
                 tmp = Path(tmp)
